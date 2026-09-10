@@ -5,6 +5,7 @@ type AgentContext = {
 
 type ResponsesRequest = {
     input?: string | Array<unknown>;
+    stream?: boolean;
 };
 
 export default async function agent({
@@ -22,7 +23,7 @@ export default async function agent({
     const catalog = (await models.json()) as { data?: Array<unknown> };
     const text = `TypeScript code agent received ${JSON.stringify(input.input)} and can see ${catalog.data?.length ?? 0} models.`;
 
-    return Response.json({
+    const response = {
         id: `resp_${crypto.randomUUID()}`,
         object: "response",
         created_at: Math.floor(Date.now() / 1000),
@@ -48,5 +49,16 @@ export default async function agent({
             output_tokens: 0,
             total_tokens: 0,
         },
-    });
+    };
+
+    if (!input.stream) return Response.json(response);
+
+    const events = [
+        { type: "response.output_text.delta", delta: text, sequence_number: 0 },
+        { type: "response.completed", response, sequence_number: 1 },
+    ];
+    return new Response(
+        `${events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("")}data: [DONE]\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+    );
 }
