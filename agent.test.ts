@@ -1,8 +1,42 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+import path from "node:path";
 import test from "node:test";
-import agent from "./agent.ts";
 
-const tools = [
+const repo = process.env.POLLINATIONS_REPO;
+assert.ok(
+    repo,
+    "Set POLLINATIONS_REPO to the code-agents Pollinations checkout.",
+);
+const require = createRequire(path.join(repo, "package.json"));
+const { build } = require("esbuild");
+const OpenAI = require("openai").default;
+const { outputFiles } = await build({
+    stdin: {
+        contents: `
+import agent from ${JSON.stringify(path.join(import.meta.dirname, "agent.ts"))};
+import createWorker from ${JSON.stringify(path.join(repo, "enter.pollinations.ai/src/services/code-agent-runtime.js"))};
+export { responsesToChatStream } from ${JSON.stringify(path.join(repo, "gen.pollinations.ai/src/text/responses/chatResponse.ts"))};
+export const worker = createWorker(agent);
+`,
+        resolveDir: repo,
+    },
+    bundle: true,
+    format: "esm",
+    platform: "node",
+    tsconfig: path.join(repo, "gen.pollinations.ai/tsconfig.json"),
+    nodePaths: [path.join(repo, "node_modules")],
+    write: false,
+    banner: {
+        js: `import {createRequire} from 'node:module'; const require=createRequire(${JSON.stringify(path.join(repo, "package.json"))});`,
+    },
+    footer: { js: "//# sourceURL=code-agent-example-test-bundle.mjs" },
+});
+const { worker, responsesToChatStream } = await import(
+    `data:text/javascript;base64,${Buffer.from(outputFiles[0].text).toString("base64")}`
+);
+const BASE = "https://staging.gen.pollinations.ai";
+const TOOLS = [
     {
         name: "listModels",
         description: "List available models",
@@ -19,112 +53,203 @@ const tools = [
     },
 ];
 
-function message(text: string) {
+function toolCall(id: string, name = "listModels", args = {}) {
     return {
-        id: `msg_${crypto.randomUUID()}`,
-        type: "message",
-        role: "assistant",
-        status: "completed",
-        content: [{ type: "output_text", text, annotations: [] }],
-    };
-}
-
-function call(id: string, tool = "listModels", args = {}) {
-    return {
-        id: `fc_${id}`,
-        type: "function_call",
-        status: "completed",
-        call_id: id,
-        name: `mcp__pollinations__${tool}`,
-        arguments: JSON.stringify(args),
-    };
-}
-
-function modelResponse(output: unknown[], input = 1, generated = 1) {
-    return Response.json({
-        id: `resp_${crypto.randomUUID()}`,
-        object: "response",
-        model: "openai/gpt-5.4-nano",
-        status: "completed",
-        output,
-        usage: {
-            input_tokens: input,
-            output_tokens: generated,
-            total_tokens: input + generated,
+        id,
+        type: "function",
+        function: {
+            name: `mcp__pollinations__${name}`,
+            arguments: JSON.stringify(args),
         },
+    };
+}
+
+function modelReply(
+    message: Record<string, unknown>,
+    input = 1,
+    output = 1,
+    stream = false,
+) {
+    const base = {
+        id: "chatcmpl-example",
+        created: 1,
+        model: "openai/gpt-5.4-nano",
+    };
+    const finish_reason = message.tool_calls ? "tool_calls" : "stop";
+    const usage = {
+        prompt_tokens: input,
+        completion_tokens: output,
+        total_tokens: input + output,
+    };
+    if (!stream) {
+        return Response.json({
+            ...base,
+            object: "chat.completion",
+            choices: [
+                {
+                    index: 0,
+                    message: { role: "assistant", ...message },
+                    finish_reason,
+                },
+            ],
+            usage,
+        });
+    }
+    const calls = message.tool_calls as
+        | ReturnType<typeof toolCall>[]
+        | undefined;
+    const delta = {
+        role: "assistant",
+        ...message,
+        ...(calls && {
+            tool_calls: calls.map((call, index) => ({ index, ...call })),
+        }),
+    };
+    const chunks = [
+        {
+            ...base,
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta, finish_reason: null }],
+        },
+        {
+            ...base,
+            object: "chat.completion.chunk",
+            choices: [{ index: 0, delta: {}, finish_reason }],
+            usage,
+        },
+    ];
+    return new Response(
+        `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`,
+        { headers: { "content-type": "text/event-stream" } },
+    );
+}
+
+function request(input: unknown, stream = false) {
+    return new Request(`${BASE}/v1/responses`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+            model: "voodoohop/pollinations-code-agent-example",
+            input,
+            stream,
+            max_output_tokens: 123,
+        }),
     });
 }
 
-test("runs multiple tool rounds, preserves replay history, and sums model usage", async () => {
-    const history = [
-        { role: "user", content: "What models are available?" },
-        call("previous"),
-        {
-            id: "result_previous",
-            type: "function_call_output",
-            call_id: "previous",
-            output: '{"content":[{"type":"text","text":"Previous result"}]}',
-        },
-        { role: "user", content: "Make a cat image using an available model." },
-    ];
-    const requests: {
+function events(text: string) {
+    return text
+        .split("\n")
+        .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+        .map((line) => JSON.parse(line.slice(6)));
+}
+
+test("real SDK loops through MCP, preserves replay, and sums every model turn", async (t) => {
+    const messages: {
         model: string;
-        input: { type?: string; call_id?: string }[];
-        tools: { name: string }[];
+        max_tokens: number;
+        messages: { tool_call_id?: string }[];
     }[] = [];
     const executed: unknown[] = [];
     const replies = [
-        modelResponse([call("models")], 10, 2),
-        modelResponse(
-            [call("image", "generateImage", { prompt: "a cat" })],
-            7,
-            3,
-        ),
-        modelResponse([message("Here is your cat image.")], 9, 8),
-    ];
-    const mcp = Object.assign(
-        async (server: string, tool: string, args: unknown) => {
-            executed.push({ server, tool, args });
-            return { content: [{ type: "text", text: `${tool} succeeded` }] };
+        {
+            message: { content: null, tool_calls: [toolCall("models")] },
+            input: 10,
+            output: 2,
         },
         {
-            listTools: async (server: string) => {
-                assert.equal(server, "pollinations");
-                return tools;
+            message: {
+                content: null,
+                tool_calls: [
+                    toolCall("image", "generateImage", { prompt: "a cat" }),
+                ],
             },
+            input: 7,
+            output: 3,
         },
-    );
-    const response = await agent({
-        request: new Request("https://agent.test/v1/responses", {
-            method: "POST",
-            body: JSON.stringify({ input: history }),
-        }),
-        pollinations: async (path, init) => {
-            assert.equal(path, "/v1/responses");
-            requests.push(JSON.parse(String(init?.body)));
+        {
+            message: { content: "Here is your cat image." },
+            input: 9,
+            output: 8,
+        },
+    ];
+    t.mock.method(
+        globalThis,
+        "fetch",
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+            const incoming = new Request(input, init);
+            const body = await incoming.json();
+            if (incoming.url === `${BASE}/mcp/pollinations`) {
+                if (body.method === "tools/list")
+                    return Response.json({
+                        jsonrpc: "2.0",
+                        id: body.id,
+                        result: { tools: TOOLS },
+                    });
+                assert.equal(body.method, "tools/call");
+                executed.push(body.params);
+                return Response.json({
+                    jsonrpc: "2.0",
+                    id: body.id,
+                    result: {
+                        content: [
+                            {
+                                type: "text",
+                                text: `${body.params.name} succeeded`,
+                            },
+                        ],
+                    },
+                });
+            }
+            assert.equal(incoming.url, `${BASE}/v1/chat/completions`);
+            messages.push(body);
             const reply = replies.shift();
             assert.ok(reply, "unexpected extra model call");
-            return reply;
+            return modelReply(
+                reply.message,
+                reply.input,
+                reply.output,
+                body.stream,
+            );
         },
-        mcp,
-    });
-    assert.equal(response.status, 200);
+    );
+    const response = await worker.fetch(
+        request([
+            { role: "user", content: "What models are available?" },
+            {
+                type: "function_call",
+                id: "fc_previous",
+                call_id: "previous",
+                name: "mcp__pollinations__listModels",
+                arguments: "{}",
+                status: "completed",
+            },
+            {
+                type: "function_call_output",
+                id: "fco_previous",
+                call_id: "previous",
+                output: '{"content":[{"type":"text","text":"Previous result"}]}',
+                status: "completed",
+            },
+            {
+                role: "user",
+                content: "Make a cat image using an available model.",
+            },
+        ]),
+        { POLLINATIONS_BASE_URL: BASE },
+    );
+    assert.equal(response.status, 200, await response.clone().text());
     const result = await response.json();
     assert.equal(result.status, "completed");
-    assert.equal(requests.length, 3);
-    assert.deepEqual(requests[0].input, history);
-    assert.equal(requests[0].model, "openai/gpt-5.4-nano");
-    assert.deepEqual(
-        requests[0].tools.map((tool: { name: string }) => tool.name),
-        ["mcp__pollinations__listModels", "mcp__pollinations__generateImage"],
+    assert.equal(messages.length, 3);
+    assert.equal(messages[0].model, "openai/gpt-5.4-nano");
+    assert.equal(messages[0].max_tokens, 123);
+    assert.ok(
+        messages[0].messages.some((item) => item.tool_call_id === "previous"),
     );
     assert.deepEqual(executed, [
-        { server: "pollinations", tool: "listModels", args: {} },
-        {
-            server: "pollinations",
-            tool: "generateImage",
-            args: { prompt: "a cat" },
-        },
+        { name: "listModels", arguments: {} },
+        { name: "generateImage", arguments: { prompt: "a cat" } },
     ]);
     assert.deepEqual(
         result.output.map((item: { type: string }) => item.type),
@@ -144,246 +269,242 @@ test("runs multiple tool rounds, preserves replay history, and sums model usage"
         assert.notEqual(pair[0].id, pair[1].id);
         assert.equal(pair[0].status, "completed");
         assert.equal(pair[1].status, "completed");
-        assert.equal(typeof pair[1].output, "string");
         assert.ok(JSON.parse(pair[1].output).content);
     }
     assert.equal(result.usage.input_tokens, 26);
     assert.equal(result.usage.output_tokens, 13);
     assert.equal(result.usage.total_tokens, 39);
-    assert.ok(
-        requests[2].input.some(
-            (item) =>
-                item.call_id === "image" &&
-                item.type === "function_call_output",
-        ),
-    );
 });
 
-test("feeds MCP exceptions back to the model as tool failures", async () => {
+test("SDK tool streaming works with OpenAI Responses and the Gen Chat adapter", async (t) => {
     let turns = 0;
-    const response = await agent({
-        request: new Request("https://agent.test/v1/responses", {
-            method: "POST",
-            body: JSON.stringify({ input: "Make an image." }),
-        }),
-        pollinations: async (_path, init) => {
-            if (turns++ === 0)
-                return modelResponse([
-                    call("broken", "generateImage", { prompt: "a cat" }),
-                ]);
-            const body = JSON.parse(String(init?.body));
-            const feedback = body.input.find(
-                (item: { type: string }) =>
-                    item.type === "function_call_output",
+    t.mock.method(
+        globalThis,
+        "fetch",
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+            const incoming = new Request(input, init);
+            const body = await incoming.json();
+            if (incoming.url.endsWith("/mcp/pollinations")) {
+                return Response.json({
+                    jsonrpc: "2.0",
+                    id: body.id,
+                    result:
+                        body.method === "tools/list"
+                            ? { tools: TOOLS }
+                            : {
+                                  content: [
+                                      {
+                                          type: "text",
+                                          text: "Models available.",
+                                      },
+                                  ],
+                              },
+                });
+            }
+            assert.equal(body.stream, true);
+            return modelReply(
+                turns++ === 0
+                    ? { content: null, tool_calls: [toolCall("stream_tool")] }
+                    : { content: "Models listed." },
+                10,
+                2,
+                true,
             );
-            assert.ok(feedback, "the model must receive the tool failure");
-            const result = JSON.parse(feedback.output);
-            assert.equal(result.isError, true);
-            assert.match(feedback.output, /image service unavailable/);
-            return modelResponse([
-                message("The image service is unavailable."),
-            ]);
         },
-        mcp: Object.assign(
-            async () => {
-                throw new Error("image service unavailable");
-            },
-            { listTools: async () => tools },
-        ),
-    });
-    assert.equal(response.status, 200);
-    const result = await response.json();
-    assert.equal(result.status, "completed");
-    assert.equal(turns, 2);
-    assert.equal(
-        result.output.at(-1).content[0].text,
-        "The image service is unavailable.",
     );
-});
-
-test("executes at most eight tools and disables further tool selection", async () => {
-    let executions = 0;
-    let turns = 0;
-    const response = await agent({
-        request: new Request("https://agent.test/v1/responses", {
-            method: "POST",
-            body: JSON.stringify({ input: "Check the models repeatedly." }),
-        }),
-        pollinations: async (_path, init) => {
-            if (turns++ === 0)
-                return modelResponse(
-                    Array.from({ length: 8 }, (_, index) =>
-                        call(`call_${index}`),
-                    ),
-                );
-            assert.equal(turns, 2, "the budget must terminate the tool loop");
-            const body = JSON.parse(String(init?.body));
-            assert.equal(body.tool_choice, "none");
-            const outputs = body.input.filter(
-                (item: { type: string }) =>
-                    item.type === "function_call_output",
-            );
-            assert.equal(
-                outputs.length,
-                8,
-                "every call must have a result for valid history",
-            );
-            return modelResponse([message("Finished within the tool budget.")]);
-        },
-        mcp: Object.assign(
-            async () => {
-                executions++;
-                return { content: [{ type: "text", text: "ok" }] };
-            },
-            { listTools: async () => tools },
-        ),
-    });
-    assert.equal(response.status, 200);
-    assert.equal(executions, 8);
-    assert.equal((await response.json()).status, "completed");
-});
-
-test("rejects an oversized tool batch before any tool executes", async () => {
-    let executions = 0;
-    const response = await agent({
-        request: new Request("https://agent.test/v1/responses", {
-            method: "POST",
-            body: JSON.stringify({ input: "Check the models repeatedly." }),
-        }),
-        pollinations: async () =>
-            modelResponse(
-                Array.from({ length: 9 }, (_, index) => call(`call_${index}`)),
-            ),
-        mcp: Object.assign(
-            async () => {
-                executions++;
-            },
-            { listTools: async () => tools },
-        ),
-    });
-    assert.equal(response.status, 502);
-    assert.equal(executions, 0);
-    const result = await response.json();
-    assert.equal(result.status, "failed");
-    assert.match(result.error.message, /8-tool-call limit/);
-});
-
-test("returns a failed Responses object for a nonstream model HTTP error", async () => {
-    const response = await agent({
-        request: new Request("https://agent.test/v1/responses", {
-            method: "POST",
-            body: JSON.stringify({ input: "Hello" }),
-        }),
-        pollinations: async () =>
-            new Response("provider unavailable", { status: 429 }),
-        mcp: Object.assign(
-            async () => {
-                throw new Error("No tool should execute");
-            },
-            { listTools: async () => tools },
-        ),
-    });
-    assert.equal(response.status, 502);
-    const result = await response.json();
-    assert.equal(result.object, "response");
-    assert.equal(result.status, "failed");
-    assert.deepEqual(result.error, {
-        code: "agent_error",
-        message: "Model request failed (429)",
-    });
-});
-
-test("streams completed Responses items and one terminal event", async () => {
-    let turns = 0;
-    const response = await agent({
-        request: new Request("https://agent.test/v1/responses", {
-            method: "POST",
-            body: JSON.stringify({ input: "List the models.", stream: true }),
-        }),
-        pollinations: async () =>
-            turns++ === 0
-                ? modelResponse([call("stream_tool")])
-                : modelResponse([message("Models listed.")]),
-        mcp: Object.assign(
-            async () => ({ content: [{ type: "text", text: "model list" }] }),
-            { listTools: async () => tools },
-        ),
+    const response = await worker.fetch(request("List the models.", true), {
+        POLLINATIONS_BASE_URL: BASE,
     });
     assert.equal(response.status, 200);
     assert.match(
         response.headers.get("content-type") ?? "",
         /text\/event-stream/,
     );
-    const frames = (await response.text()).split("\n\n").filter(Boolean);
-    assert.equal(frames.at(-1), "data: [DONE]");
-    const events = frames.slice(0, -1).map((frame) => {
-        const data = frame
-            .split("\n")
-            .find((line) => line.startsWith("data: "));
-        assert.ok(data);
-        return JSON.parse(data.slice(6));
-    });
-    assert.equal(events[0].type, "response.created");
-    assert.equal(events.at(-1).type, "response.completed");
+    const sse = await response.text();
+    const chunks = events(sse);
+    assert.equal(chunks[0].type, "response.created");
+    assert.equal(chunks.at(-1).type, "response.completed");
     assert.equal(
-        events.filter((event) => event.type === "response.completed").length,
+        chunks.filter((event) => event.type === "response.completed").length,
         1,
     );
+    assert.ok(
+        chunks.some((event) => event.type === "response.output_text.delta"),
+    );
+    assert.match(sse, /data: \[DONE\]\n\n$/);
+    const client = new OpenAI({
+        apiKey: "unused",
+        fetch: async () =>
+            new Response(sse, {
+                headers: { "content-type": "text/event-stream" },
+            }),
+    });
+    const final = await client.responses
+        .stream({ model: "example", input: "hi" })
+        .finalResponse();
+    assert.equal(final.output.at(-1).content[0].text, "Models listed.");
+    assert.equal(final.output.length, 3);
+    assert.equal(final.usage.total_tokens, 24);
+    const chat = events(
+        await new Response(
+            responsesToChatStream(new Response(sse).body, "example"),
+        ).text(),
+    );
     assert.equal(
-        events.some((event) => event.type === "response.output_text.delta"),
+        chat
+            .flatMap((chunk) => chunk.choices ?? [])
+            .some((choice) => choice.delta?.tool_calls),
         false,
     );
-    const terminal = events.at(-1).response;
-    const added = events.filter(
-        (event) => event.type === "response.output_item.added",
-    );
-    const done = events.filter(
-        (event) => event.type === "response.output_item.done",
-    );
-    assert.equal(added.length, terminal.output.length);
-    assert.deepEqual(
-        done.map((event) => event.item),
-        terminal.output,
-    );
-    assert.deepEqual(
-        events.map((event) => event.sequence_number),
-        events.map((_, index) => index),
-    );
-    assert.equal(terminal.status, "completed");
-    assert.equal(terminal.output.at(-1).content[0].text, "Models listed.");
+    const text = chat
+        .flatMap((chunk) => chunk.choices ?? [])
+        .map((choice) => choice.delta?.content ?? "")
+        .join("");
+    assert.equal(text.split("Models listed.").length - 1, 1);
 });
 
-test("ends a failed model stream with response.failed and DONE", async () => {
-    const response = await agent({
-        request: new Request("https://agent.test/v1/responses", {
-            method: "POST",
-            body: JSON.stringify({ input: "Hello", stream: true }),
-        }),
-        pollinations: async () =>
-            new Response("provider unavailable", { status: 503 }),
-        mcp: Object.assign(
-            async () => {
-                throw new Error("No tool should execute");
-            },
-            { listTools: async () => tools },
-        ),
+test("MCP failure is fed back to the model for a useful response", async (t) => {
+    let turns = 0;
+    t.mock.method(
+        globalThis,
+        "fetch",
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+            const incoming = new Request(input, init);
+            const body = await incoming.json();
+            if (incoming.url.endsWith("/mcp/pollinations")) {
+                return body.method === "tools/list"
+                    ? Response.json({
+                          jsonrpc: "2.0",
+                          id: body.id,
+                          result: { tools: TOOLS },
+                      })
+                    : new Response("unavailable", { status: 503 });
+            }
+            if (turns++ === 0)
+                return modelReply({
+                    content: null,
+                    tool_calls: [toolCall("failed")],
+                });
+            assert.match(
+                JSON.stringify(body.messages),
+                /MCP tool call failed \(503\)/,
+            );
+            return modelReply({ content: "The tool service is unavailable." });
+        },
+    );
+    const response = await worker.fetch(request("List the models."), {
+        POLLINATIONS_BASE_URL: BASE,
     });
     assert.equal(response.status, 200);
-    const frames = (await response.text()).split("\n\n").filter(Boolean);
-    assert.equal(frames.at(-1), "data: [DONE]");
-    const events = frames.slice(0, -1).map((frame) => {
-        const data = frame
-            .split("\n")
-            .find((line) => line.startsWith("data: "));
-        assert.ok(data);
-        return JSON.parse(data.slice(6));
-    });
-    assert.equal(events[0].type, "response.created");
-    assert.equal(events.at(-1).type, "response.failed");
-    assert.equal(events.at(-1).response.status, "failed");
-    assert.ok(events.at(-1).response.error.message);
+    const result = await response.json();
+    assert.equal(result.status, "completed");
     assert.equal(
-        events.some((event) => event.type === "response.completed"),
-        false,
+        result.output.at(-1).content[0].text,
+        "The tool service is unavailable.",
     );
+    assert.equal(turns, 2);
+});
+
+test("model failure does not retry billed requests", async (t) => {
+    t.mock.method(console, "error", () => {});
+    for (const stream of [false, true]) {
+        let turns = 0;
+        const mock = t.mock.method(
+            globalThis,
+            "fetch",
+            async (input: RequestInfo | URL, init?: RequestInit) => {
+                const incoming = new Request(input, init);
+                const body = await incoming.json();
+                if (incoming.url.endsWith("/mcp/pollinations"))
+                    return Response.json({
+                        jsonrpc: "2.0",
+                        id: body.id,
+                        result: { tools: TOOLS },
+                    });
+                turns++;
+                return Response.json(
+                    { error: { message: "Provider unavailable" } },
+                    { status: 503 },
+                );
+            },
+        );
+        const response = await worker.fetch(request("Hello", stream), {
+            POLLINATIONS_BASE_URL: BASE,
+        });
+        if (stream) {
+            const chunks = events(await response.text());
+            assert.equal(chunks.at(-1).type, "response.failed");
+            assert.equal(
+                chunks.some((event) => event.type === "response.completed"),
+                false,
+            );
+        } else {
+            assert.ok(response.status >= 400);
+            assert.match(
+                (await response.json()).error.message,
+                /Provider unavailable/,
+            );
+        }
+        assert.equal(turns, 1);
+        mock.mock.restore();
+    }
+});
+
+test("reports exhaustion when the SDK stops after five tool-use steps", async (t) => {
+    for (const stream of [false, true]) {
+        let modelCalls = 0;
+        let toolCalls = 0;
+        const mock = t.mock.method(
+            globalThis,
+            "fetch",
+            async (input: RequestInfo | URL, init?: RequestInit) => {
+                const incoming = new Request(input, init);
+                const body = await incoming.json();
+                if (incoming.url.endsWith("/mcp/pollinations")) {
+                    if (body.method === "tools/list")
+                        return Response.json({
+                            jsonrpc: "2.0",
+                            id: body.id,
+                            result: { tools: TOOLS },
+                        });
+                    toolCalls++;
+                    return Response.json({
+                        jsonrpc: "2.0",
+                        id: body.id,
+                        result: {
+                            content: [{ type: "text", text: "Models listed." }],
+                        },
+                    });
+                }
+                modelCalls++;
+                return modelReply(
+                    {
+                        content: null,
+                        tool_calls: [toolCall(`step_${modelCalls}`)],
+                    },
+                    1,
+                    1,
+                    body.stream,
+                );
+            },
+        );
+        const response = await worker.fetch(
+            request("Keep checking the models.", stream),
+            { POLLINATIONS_BASE_URL: BASE },
+        );
+        const result = stream
+            ? events(await response.text()).at(-1).response
+            : await response.json();
+        assert.equal(modelCalls, 5);
+        assert.equal(toolCalls, 5);
+        assert.equal(response.status, 200);
+        assert.equal(result.status, "incomplete");
+        assert.equal(result.incomplete_details.reason, "max_output_tokens");
+        assert.match(
+            result.output.at(-1).content[0].text,
+            /stopping condition without a final answer/,
+        );
+        assert.equal(result.usage.total_tokens, 10);
+        mock.mock.restore();
+    }
 });
