@@ -1,4 +1,4 @@
-name: Sync staging agent
+name: Sync agent
 
 on:
   push:
